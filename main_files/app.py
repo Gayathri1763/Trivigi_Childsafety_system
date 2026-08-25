@@ -3,9 +3,13 @@ import os
 import json
 import time
 import threading
-from flask import Flask, render_template, Response, request, jsonify, send_from_directory, redirect, url_for
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, render_template, Response, request, jsonify, send_from_directory
+from flask_socketio import SocketIO
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+executor = ThreadPoolExecutor(max_workers=2)
 
 # ── Paths ─────────────────────────────────────────────────────────
 REGISTERED_DIR = "registered_faces"
@@ -28,13 +32,18 @@ current_frame    = None
 frame_lock       = threading.Lock()
 last_child_pos   = None
 inactivity_start = None
+last_alert_time  = {}
+face_pending     = False
 
 
 # ── Settings ──────────────────────────────────────────────────────
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(SETTINGS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return DEFAULT_SETTINGS.copy()
     return DEFAULT_SETTINGS.copy()
 
 
@@ -43,7 +52,7 @@ def save_settings_file(data):
         json.dump(data, f)
 
 
-# ── Snapshot ──────────────────────────────────────────────────────
+# ── Snapshot and Alerts ───────────────────────────────────────────
 def take_snapshot(label, frame):
     ts       = time.strftime("%Y%m%d_%H%M%S")
     filename = f"{label}_{ts}.jpg"
@@ -51,14 +60,20 @@ def take_snapshot(label, frame):
     return filename
 
 
-def add_alert(alert_type, message, snapshot=None):
-    alerts_log.append({
+def add_alert(alert_type, message, snapshot=None, cooldown=5):
+    now = time.time()
+    if alert_type in last_alert_time and (now - last_alert_time[alert_type]) < cooldown:
+        return
+    last_alert_time[alert_type] = now
+    alert_item = {
         "type":     alert_type,
         "message":  message,
         "time":     time.strftime("%H:%M:%S"),
         "snapshot": snapshot,
         "resolved": None
-    })
+    }
+    alerts_log.append(alert_item)
+    socketio.emit("new_alert", alert_item)
 
 
 # ── Face helpers ──────────────────────────────────────────────────
@@ -66,83 +81,116 @@ def get_registered():
     return [
         os.path.join(REGISTERED_DIR, f)
         for f in os.listdir(REGISTERED_DIR)
-        if f.lower().endswith((".jpg",".png",".jpeg"))
+        if f.lower().endswith((".jpg", ".png", ".jpeg"))
     ]
 
 
 def is_covered(face_img):
-    import numpy as np
     if face_img is None or face_img.size == 0:
         return False
     h, w = face_img.shape[:2]
     if h < 20 or w < 20:
         return False
     upper_var = float(cv2.cvtColor(
-        face_img[:h//2,:], cv2.COLOR_BGR2GRAY).var())
+        face_img[:h//2, :], cv2.COLOR_BGR2GRAY).var())
     lower_var = float(cv2.cvtColor(
-        face_img[h//2:,:], cv2.COLOR_BGR2GRAY).var())
-    return upper_var > 0 and lower_var/(upper_var+1e-5) < 0.35
+        face_img[h//2:, :], cv2.COLOR_BGR2GRAY).var())
+    return upper_var > 0 and lower_var / (upper_var + 1e-5) < 0.35
 
 
-def check_face(face_crop):
-    from deepface import DeepFace
-    if is_covered(face_crop):
-        return "UNIDENTIFIED"
-    reg = get_registered()
-    if not reg:
-        return "NO_REG"
-    tmp = os.path.join(SNAPSHOT_DIR, "tmp_check.jpg")
-    cv2.imwrite(tmp, face_crop)
+def check_face_async(face_crop):
+    global face_pending
     try:
-        for r in reg:
-            res = DeepFace.verify(tmp, r,
-                enforce_detection=False, silent=True)
-            if res["verified"]:
-                return "AUTHORIZED"
-        return "UNAUTHORIZED"
-    except Exception:
-        return "UNIDENTIFIED"
+        from deepface import DeepFace
+        if is_covered(face_crop):
+            status = "UNIDENTIFIED"
+        else:
+            reg = get_registered()
+            if not reg:
+                status = "NO_REG"
+            else:
+                tmp = os.path.join(
+                    SNAPSHOT_DIR,
+                    f"tmp_check_{threading.get_ident()}.jpg"
+                )
+                cv2.imwrite(tmp, face_crop)
+                status = "UNAUTHORIZED"
+                try:
+                    for r in reg:
+                        res = DeepFace.verify(
+                            tmp, r,
+                            enforce_detection=False,
+                            silent=True
+                        )
+                        if res.get("verified", False):
+                            status = "AUTHORIZED"
+                            break
+                finally:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+
+        if status == "UNAUTHORIZED":
+            add_alert("UNAUTHORIZED", "Unauthorized person detected")
+        elif status == "UNIDENTIFIED":
+            add_alert("UNIDENTIFIED", "Face covered or unclear")
+
+    except Exception as e:
+        print(f"[ERROR] Face processing error: {e}")
+    finally:
+        face_pending = False
 
 
 # ── Background camera thread ──────────────────────────────────────
 def camera_loop():
-    global current_frame, last_child_pos, inactivity_start
+    global current_frame, last_child_pos, inactivity_start, face_pending
 
     from ultralytics import YOLO
-    import numpy as np
+    from picamera2 import Picamera2
 
-    cap   = cv2.VideoCapture(0)
-    yolo  = YOLO("yolov8n.pt")
-    fc    = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    # ── Initialize Picamera2 ──────────────────────────────────────
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(
+        main={"size": (640, 480), "format": "XBGR8888"}
     )
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2)
+    print("[INFO] Picamera2 started successfully")
 
-    # Throttle face recognition — only check every N frames
+    # ── Load YOLO ─────────────────────────────────────────────────
+    yolo = YOLO("yolov8n.pt")
+
+    # ── Load face cascade ─────────────────────────────────────────
+    cascade_path = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+    fc = cv2.CascadeClassifier(cascade_path)
+    if fc.empty():
+        print("[WARN] Face cascade not loaded")
+        fc = None
+
     face_check_interval = 10
     frame_idx = 0
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            time.sleep(0.05)
-            continue
+        # ── Capture frame from Picamera2 ──────────────────────────
+        frame_rgba = picam2.capture_array()
+        frame = cv2.cvtColor(frame_rgba, cv2.COLOR_BGRA2BGR)
 
-        settings         = load_settings()
-        expected         = settings.get("expected_count", 2)
-        inact_thresh     = settings.get("inactivity_seconds", 30)
-        mode             = settings.get("mode", "child")
-        pos_thresh       = 80
-        frame_idx       += 1
+        settings     = load_settings()
+        expected     = settings.get("expected_count", 2)
+        inact_thresh = settings.get("inactivity_seconds", 30)
+        mode         = settings.get("mode", "child")
+        pos_thresh   = 80
+        frame_idx   += 1
 
-        # ── Low light ─────────────────────────────────────────────
+        # ── Low light check ───────────────────────────────────────
         bright = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean()
         if bright < 50:
-            cv2.putText(frame, "LOW LIGHT", (10,30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+            cv2.putText(frame, "LOW LIGHT", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             add_alert("LOW_LIGHT", "Room too dark")
             with frame_lock:
                 current_frame = frame.copy()
-            time.sleep(0.5)
+            time.sleep(0.04)
             continue
 
         # ── YOLO person detection ─────────────────────────────────
@@ -151,8 +199,8 @@ def camera_loop():
         for r in results:
             for b in r.boxes:
                 if int(b.cls[0]) == 0:
-                    x1,y1,x2,y2 = map(int, b.xyxy[0])
-                    person_boxes.append((x1,y1,x2,y2))
+                    x1, y1, x2, y2 = map(int, b.xyxy[0])
+                    person_boxes.append((x1, y1, x2, y2))
 
         count = len(person_boxes)
 
@@ -164,48 +212,32 @@ def camera_loop():
                       snap)
 
         # ── Face check every N frames ─────────────────────────────
-        if frame_idx % face_check_interval == 0:
+        if fc is not None and frame_idx % face_check_interval == 0:
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = fc.detectMultiScale(gray, 1.1, 4)
-            for (fx,fy,fw,fh) in faces:
-                crop   = frame[fy:fy+fh, fx:fx+fw]
-                status = check_face(crop)
-
-                color = {
-                    "AUTHORIZED":    (0,255,0),
-                    "UNAUTHORIZED":  (0,0,255),
-                    "UNIDENTIFIED":  (0,165,255),
-                    "NO_REG":        (200,200,200)
-                }.get(status, (200,200,200))
-
-                cv2.rectangle(frame,(fx,fy),(fx+fw,fy+fh),color,2)
-                cv2.putText(frame, status,(fx,fy-8),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
-
-                if status == "UNAUTHORIZED":
-                    snap = take_snapshot("unauth", frame)
-                    add_alert("UNAUTHORIZED",
-                              "Unauthorized person detected", snap)
-                elif status == "UNIDENTIFIED":
-                    snap = take_snapshot("unident", frame)
-                    add_alert("UNIDENTIFIED",
-                              "Face covered or unclear", snap)
+            for (fx, fy, fw, fh) in faces:
+                cv2.rectangle(frame, (fx, fy),
+                              (fx+fw, fy+fh), (255, 165, 0), 2)
+                if not face_pending:
+                    face_pending = True
+                    crop = frame[fy:fy+fh, fx:fx+fw].copy()
+                    executor.submit(check_face_async, crop)
 
         # ── Draw person boxes ─────────────────────────────────────
         colors_box = [(0,255,0),(255,0,0),(0,255,255),(255,0,255)]
-        for i,(x1,y1,x2,y2) in enumerate(person_boxes):
+        for i, (x1, y1, x2, y2) in enumerate(person_boxes):
             c = colors_box[min(i, len(colors_box)-1)]
-            cv2.rectangle(frame,(x1,y1),(x2,y2),c,2)
-            label = "Child" if i==0 and mode=="child" else "Person"
-            cv2.putText(frame,label,(x1,y1-8),
-                cv2.FONT_HERSHEY_SIMPLEX,0.6,c,2)
+            cv2.rectangle(frame, (x1,y1), (x2,y2), c, 2)
+            label = "Child" if i == 0 and mode == "child" else "Person"
+            cv2.putText(frame, label, (x1, y1-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
 
-        # ── Inactivity (child mode) ───────────────────────────────
+        # ── Inactivity detection ──────────────────────────────────
         if mode == "child" and person_boxes:
-            x1,y1,x2,y2 = person_boxes[0]
-            cx = (x1+x2)//2
-            cy = (y1+y2)//2
-            pos = (cx,cy)
+            x1, y1, x2, y2 = person_boxes[0]
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            pos = (cx, cy)
 
             if last_child_pos:
                 dist = ((pos[0]-last_child_pos[0])**2 +
@@ -216,13 +248,13 @@ def camera_loop():
                     else:
                         secs = int(time.time()-inactivity_start)
                         cv2.putText(frame,
-                            f"Still:{secs}s/{inact_thresh}s",
-                            (10,60),cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,(255,165,0),2)
+                                    f"Still:{secs}s/{inact_thresh}s",
+                                    (10,60), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7, (255,165,0), 2)
                         if secs >= inact_thresh:
-                            snap = take_snapshot("inact",frame)
+                            snap = take_snapshot("inact", frame)
                             add_alert("INACTIVITY",
-                                "Child not moved",snap)
+                                      "Child not moved", snap)
                             inactivity_start = None
                 else:
                     inactivity_start = None
@@ -230,14 +262,14 @@ def camera_loop():
 
         # ── HUD ───────────────────────────────────────────────────
         cv2.putText(frame,
-            f"Persons:{count}/{expected} | {mode.upper()} MODE",
-            (10, frame.shape[0]-10),
-            cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2)
+                    f"Persons:{count}/{expected} | {mode.upper()} MODE",
+                    (10, frame.shape[0]-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
 
         with frame_lock:
             current_frame = frame.copy()
 
-        time.sleep(0.08)
+        time.sleep(0.03)
 
 
 # ── MJPEG stream ──────────────────────────────────────────────────
@@ -247,8 +279,10 @@ def generate():
             if current_frame is None:
                 time.sleep(0.05)
                 continue
-            ret, buf = cv2.imencode(".jpg", current_frame,
-                                    [cv2.IMWRITE_JPEG_QUALITY, 70])
+            ret, buf = cv2.imencode(
+                ".jpg", current_frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 70]
+            )
             if not ret:
                 continue
             data = buf.tobytes()
@@ -256,7 +290,7 @@ def generate():
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n\r\n"
                + data + b"\r\n")
-        time.sleep(0.08)
+        time.sleep(0.04)
 
 
 # ── Routes ────────────────────────────────────────────────────────
@@ -271,13 +305,13 @@ def index():
 @app.route("/video_feed")
 def video_feed():
     return Response(generate(),
-        mimetype="multipart/x-mixed-replace; boundary=frame")
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/register", methods=["GET"])
 def register():
     faces = [f for f in os.listdir(REGISTERED_DIR)
-             if f.lower().endswith((".jpg",".png",".jpeg"))]
+             if f.lower().endswith((".jpg", ".png", ".jpeg"))]
     return render_template("register.html", faces=faces)
 
 
@@ -286,7 +320,7 @@ def upload_face():
     if "photo" not in request.files:
         return jsonify({"success": False, "message": "No file"})
     f     = request.files["photo"]
-    label = request.form.get("label","person")
+    label = request.form.get("label", "person")
     ts    = time.strftime("%Y%m%d_%H%M%S")
     name  = f"{label}_{ts}.jpg"
     f.save(os.path.join(REGISTERED_DIR, name))
@@ -345,10 +379,22 @@ def reg_face(filename):
     return send_from_directory(REGISTERED_DIR, filename)
 
 
-# ── Start ─────────────────────────────────────────────────────────
+@app.route("/shutdown", methods=["POST"])
+def shutdown():
+    os.system("sudo shutdown now")
+    return jsonify({"success": True})
+
+
+# ── SocketIO events ───────────────────────────────────────────────
+@socketio.on("connect")
+def handle_connect():
+    from flask_socketio import emit
+    emit("connected", {"message": "Connected to Trivigi"})
+
+
+# ── Entry point ───────────────────────────────────────────────────
 if __name__ == "__main__":
     t = threading.Thread(target=camera_loop, daemon=True)
     t.start()
     print("Trivigi running → http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000,
-            debug=False, threaded=True)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
