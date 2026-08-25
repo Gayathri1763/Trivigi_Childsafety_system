@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trivigi — Alerts</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+
+<nav class="navbar">
+    <div class="brand">TRIVIGI</div>
+    <ul class="nav-links">
+        <li><a href="/">Dashboard</a></li>
+        <li><a href="/register">Register</a></li>
+        <li><a href="/alerts" class="active">Alerts</a></li>
+        <li><a href="/settings">Settings</a></li>
+    </ul>
+    <div class="status">
+        <div class="status-dot"></div>
+        <span>Live</span>
+    </div>
+</nav>
+
+<div class="page">
+
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+        <div class="page-title">Alert History</div>
+        <button class="btn btn-secondary"
+                onclick="clearAlerts()">
+            Clear All
+        </button>
+    </div>
+
+    <div id="alerts-list">
+        {% if alerts %}
+            {% for alert in alerts %}
+            <div class="alert-item {{ alert.type }}"
+                 id="alert-{{ loop.index0 }}">
+
+                {% if alert.snapshot %}
+                <img class="alert-snapshot"
+                     src="/snapshots/{{ alert.snapshot }}"
+                     alt="snapshot">
+                {% else %}
+                <div class="alert-snapshot"
+                     style="background:#21262d;display:flex;align-items:center;justify-content:center;">
+                    <span style="font-size:24px;">📷</span>
+                </div>
+                {% endif %}
+
+                <div class="alert-info">
+                    <div class="alert-type">
+                        {{ alert.type.replace("_"," ") }}
+                    </div>
+                    <div class="alert-message">{{ alert.message }}</div>
+                    <div class="alert-time">{{ alert.time }}</div>
+
+                    {% if alert.resolved is defined %}
+                    <div style="font-size:12px;color:
+                        {% if alert.resolved == 'safe' %}#3fb950
+                        {% else %}#f85149{% endif %};">
+                        Marked: {{ alert.resolved | upper }}
+                    </div>
+                    {% else %}
+                    <div class="alert-actions">
+                        <button class="btn btn-safe btn-sm"
+                                onclick="resolveAlert({{ loop.index0 }}, 'safe', this)">
+                            Safe
+                        </button>
+                        <button class="btn btn-unsafe btn-sm"
+                                onclick="resolveAlert({{ loop.index0 }}, 'unsafe', this)">
+                            Unsafe
+                        </button>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        {% else %}
+            <p style="color:#8b949e;font-size:14px;">
+                No alerts recorded yet.
+            </p>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+    const socket = io();
+
+    socket.on("new_alert", (alert) => {
+        location.reload();
+    });
+
+    function resolveAlert(index, status, btn) {
+        fetch("/resolve_alert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ index, status })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                const actions = btn.parentElement;
+                actions.innerHTML = `
+                    <span style="font-size:12px;color:
+                        ${status === 'safe' ? '#3fb950' : '#f85149'};">
+                        Marked: ${status.toUpperCase()}
+                    </span>`;
+            }
+        });
+    }
+
+    function clearAlerts() {
+        if (!confirm("Clear all alerts?")) return;
+        fetch("/clear_alerts", { method: "POST" })
+            .then(() => location.reload());
+    }
+</script>
+
+</body>
+</html>

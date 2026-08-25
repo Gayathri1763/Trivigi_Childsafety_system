@@ -1,0 +1,9 @@
+TestFiles/
+__pycache__/
+*.pyc
+snapshots/
+registered_faces/
+*.jpg
+*.png
+*.jpeg
+.deepface/

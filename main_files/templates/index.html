@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trivigi — Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="navbar">
+    <div class="brand">TRIVIGI</div>
+    <ul class="nav-links">
+        <li><a href="/" class="active">Dashboard</a></li>
+        <li><a href="/register">Register</a></li>
+        <li><a href="/alerts">Alerts</a></li>
+        <li><a href="/settings">Settings</a></li>
+    </ul>
+    <div class="status">
+        <div class="status-dot"></div>
+        <span>Live</span>
+    </div>
+</nav>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<div class="page">
+
+    <!-- Stats row -->
+    <div class="grid-3" style="margin-bottom:20px;">
+        <div class="stat-box">
+            <div class="stat-number" id="alert-count">0</div>
+            <div class="stat-label">Alerts Today</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-number" style="color:#3fb950;">
+                {{ settings.expected_count }}
+            </div>
+            <div class="stat-label">Expected Persons</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-number" style="color:#a371f7;font-size:18px;padding-top:8px;">
+                {{ settings.mode | upper }}
+            </div>
+            <div class="stat-label">Current Mode</div>
+        </div>
+    </div>
+
+    <div class="grid-2">
+
+        <!-- Live feed -->
+        <div>
+            <div class="card-title">Live Camera Feed</div>
+            <div class="feed-container">
+                <img src="/video_feed" alt="Live Feed">
+                <div class="feed-badge">
+                    <div class="status-dot"></div> LIVE
+                </div>
+                <div class="mode-badge">{{ settings.mode }} mode</div>
+            </div>
+        </div>
+
+        <!-- Recent alerts -->
+        <div>
+            <div class="card-title">Recent Alerts</div>
+            <div id="alerts-panel" style="max-height:420px;overflow-y:auto;">
+                <p style="color:#8b949e;font-size:13px;">
+                    No alerts yet. System is monitoring...
+                </p>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+    const socket = io();
+    let alertCount = 0;
+
+    socket.on("connect", () => {
+        console.log("Connected to Trivigi");
+    });
+
+    socket.on("new_alert", (alert) => {
+        alertCount++;
+        document.getElementById("alert-count").textContent = alertCount;
+        showToast(alert);
+        addAlertToPanel(alert);
+    });
+
+    function showToast(alert) {
+        const container = document.getElementById("toast-container");
+        const toast = document.createElement("div");
+        toast.className = `toast ${alert.type}`;
+        toast.innerHTML = `
+            <div class="toast-type">${alert.type.replace("_"," ")}</div>
+            <div class="toast-message">${alert.message}</div>
+            <div class="toast-time">${alert.time}</div>
+        `;
+        container.appendChild(toast);
+        setTimeout(() => toast.remove(), 5000);
+    }
+
+    function addAlertToPanel(alert) {
+        const panel = document.getElementById("alerts-panel");
+        const existing = panel.querySelector("p");
+        if (existing) existing.remove();
+
+        const item = document.createElement("div");
+        item.className = `alert-item ${alert.type}`;
+        item.innerHTML = `
+            <div class="alert-info">
+                <div class="alert-type">${alert.type.replace("_"," ")}</div>
+                <div class="alert-message">${alert.message}</div>
+                <div class="alert-time">${alert.time}</div>
+            </div>
+        `;
+        panel.insertBefore(item, panel.firstChild);
+    }
+</script>
+
+</body>
+</html>

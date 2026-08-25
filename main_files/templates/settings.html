@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trivigi — Settings</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<nav class="navbar">
+    <div class="brand">TRIVIGI</div>
+    <ul class="nav-links">
+        <li><a href="/">Dashboard</a></li>
+        <li><a href="/register">Register</a></li>
+        <li><a href="/alerts">Alerts</a></li>
+        <li><a href="/settings" class="active">Settings</a></li>
+    </ul>
+    <div class="status">
+        <div class="status-dot"></div>
+        <span>Live</span>
+    </div>
+</nav>
+
+<div class="page">
+    <div class="page-title">Settings</div>
+
+    <div class="grid-2">
+
+        <div class="card">
+            <div class="card-title">Monitoring Settings</div>
+
+            <div class="form-group">
+                <label>Monitoring Mode</label>
+                <select id="mode">
+                    <option value="child"
+                        {% if settings.mode == "child" %}selected{% endif %}>
+                        Child Mode
+                    </option>
+                    <option value="infant"
+                        {% if settings.mode == "infant" %}selected{% endif %}>
+                        Infant Mode
+                    </option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>Expected Number of Persons in Room</label>
+                <input type="number" id="expected-count"
+                       value="{{ settings.expected_count }}" min="1" max="10">
+            </div>
+
+            <div class="form-group">
+                <label>Inactivity Alert Threshold (seconds)</label>
+                <input type="number" id="inactivity-seconds"
+                       value="{{ settings.inactivity_seconds }}" min="10" max="3600">
+            </div>
+
+            <div class="toggle-wrap">
+                <label class="toggle">
+                    <input type="checkbox" id="quick-entry"
+                           {% if settings.quick_entry_alert %}checked{% endif %}>
+                    <span class="slider"></span>
+                </label>
+                <span style="font-size:14px;">Quick Entry Alert</span>
+            </div>
+            <p style="font-size:12px;color:#8b949e;margin-bottom:16px;">
+                When ON — alert fires if person enters and exits
+                before face verification completes.
+            </p>
+
+            <button class="btn btn-primary"
+                    style="width:100%;"
+                    onclick="saveSettings()">
+                Save Settings
+            </button>
+
+            <div id="save-message"
+                 style="margin-top:10px;font-size:13px;"></div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">System Info</div>
+
+            <div style="font-size:13px;color:#8b949e;line-height:2;">
+                <div>System: <span style="color:#e6edf3;">Trivigi v1.0</span></div>
+                <div>Storage: <span style="color:#e6edf3;">Local only</span></div>
+                <div>Cloud: <span style="color:#3fb950;">None</span></div>
+                <div>Auto-delete: <span style="color:#e6edf3;">24 hours</span></div>
+                <div>Remote access: <span style="color:#e6edf3;">Ngrok tunnel</span></div>
+            </div>
+
+            <div style="margin-top:20px;">
+                <div class="card-title">Danger Zone</div>
+                <button class="btn btn-danger"
+                        style="width:100%;"
+                        onclick="if(confirm('Shut down Trivigi?')) fetch('/shutdown',{method:'POST'})">
+                    Shut Down System
+                </button>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+    function saveSettings() {
+        const data = {
+            mode:              document.getElementById("mode").value,
+            expected_count:    parseInt(document.getElementById("expected-count").value),
+            inactivity_seconds: parseInt(document.getElementById("inactivity-seconds").value),
+            position_threshold: 80,
+            quick_entry_alert: document.getElementById("quick-entry").checked
+        };
+
+        fetch("/save_settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(data)
+        })
+        .then(r => r.json())
+        .then(d => {
+            const msg = document.getElementById("save-message");
+            msg.textContent = d.message;
+            msg.style.color = "#3fb950";
+            setTimeout(() => msg.textContent = "", 3000);
+        });
+    }
+</script>
+
+</body>
+</html>

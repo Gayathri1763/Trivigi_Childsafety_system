@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trivigi — Register</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<nav class="navbar">
+    <div class="brand">TRIVIGI</div>
+    <ul class="nav-links">
+        <li><a href="/">Dashboard</a></li>
+        <li><a href="/register" class="active">Register</a></li>
+        <li><a href="/alerts">Alerts</a></li>
+        <li><a href="/settings">Settings</a></li>
+    </ul>
+    <div class="status">
+        <div class="status-dot"></div>
+        <span>Live</span>
+    </div>
+</nav>
+
+<div class="page">
+    <div class="page-title">Register Faces</div>
+
+    <div class="grid-2">
+
+        <!-- Upload form -->
+        <div class="card">
+            <div class="card-title">Upload New Face</div>
+
+            <div class="form-group">
+                <label>Person Label</label>
+                <input type="text" id="label-input"
+                       placeholder="e.g. child, maid, grandma">
+            </div>
+
+            <div class="upload-area" onclick="document.getElementById('photo-input').click()">
+                <p>Click to select photo</p>
+                <p style="font-size:12px;margin-top:6px;">JPG or PNG</p>
+            </div>
+            <input type="file" id="photo-input"
+                   accept="image/*" style="display:none"
+                   onchange="previewPhoto(event)">
+
+            <div id="preview-wrap" style="display:none;margin-top:14px;">
+                <img id="preview-img" style="width:100%;border-radius:8px;max-height:200px;object-fit:cover;">
+            </div>
+
+            <button class="btn btn-primary"
+                    style="margin-top:14px;width:100%;"
+                    onclick="uploadFace()">
+                Register Face
+            </button>
+
+            <div id="upload-message" style="margin-top:10px;font-size:13px;"></div>
+        </div>
+
+        <!-- Registered faces -->
+        <div class="card">
+            <div class="card-title">Registered Faces</div>
+
+            {% if faces %}
+            <div class="faces-grid">
+                {% for face in faces %}
+                <div class="face-card" id="face-{{ face }}">
+                    <img src="/registered_faces/{{ face }}" alt="{{ face }}">
+                    <div class="face-name">{{ face }}</div>
+                    <button class="btn btn-danger btn-sm"
+                            onclick="deleteFace('{{ face }}')">
+                        Delete
+                    </button>
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <p style="color:#8b949e;font-size:13px;">
+                No faces registered yet.
+            </p>
+            {% endif %}
+        </div>
+
+    </div>
+</div>
+
+<script>
+    let selectedFile = null;
+
+    function previewPhoto(event) {
+        selectedFile = event.target.files[0];
+        if (!selectedFile) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            document.getElementById("preview-img").src = e.target.result;
+            document.getElementById("preview-wrap").style.display = "block";
+        };
+        reader.readAsDataURL(selectedFile);
+    }
+
+    function uploadFace() {
+        if (!selectedFile) {
+            alert("Please select a photo first.");
+            return;
+        }
+        const label = document.getElementById("label-input").value || "person";
+        const formData = new FormData();
+        formData.append("photo", selectedFile);
+        formData.append("label", label);
+
+        fetch("/upload_face", { method: "POST", body: formData })
+            .then(r => r.json())
+            .then(data => {
+                const msg = document.getElementById("upload-message");
+                msg.textContent = data.message;
+                msg.style.color = data.success ? "#3fb950" : "#f85149";
+                if (data.success) setTimeout(() => location.reload(), 1000);
+            });
+    }
+
+    function deleteFace(filename) {
+        if (!confirm("Delete this registered face?")) return;
+        fetch(`/delete_face/${filename}`, { method: "POST" })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById(`face-${filename}`).remove();
+                }
+            });
+    }
+</script>
+
+</body>
+</html>
