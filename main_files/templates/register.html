@@ -25,111 +25,210 @@
 <div class="page">
     <div class="page-title">Register Faces</div>
 
-    <div class="grid-2">
+    <!-- Tab buttons -->
+    <div style="display:flex;gap:12px;margin-bottom:20px;">
+        <button class="btn btn-primary" id="tab-child-btn"
+                onclick="showTab('child')">
+            Register Child
+        </button>
+        <button class="btn btn-secondary" id="tab-trusted-btn"
+                onclick="showTab('trusted')">
+            Register Trusted Member
+        </button>
+    </div>
 
-        <!-- Upload form -->
-        <div class="card">
-            <div class="card-title">Upload New Face</div>
-
-            <div class="form-group">
-                <label>Person Label</label>
-                <input type="text" id="label-input"
-                       placeholder="e.g. child, maid, grandma">
-            </div>
-
-            <div class="upload-area" onclick="document.getElementById('photo-input').click()">
-                <p>Click to select photo</p>
-                <p style="font-size:12px;margin-top:6px;">JPG or PNG</p>
-            </div>
-            <input type="file" id="photo-input"
-                   accept="image/*" style="display:none"
-                   onchange="previewPhoto(event)">
-
-            <div id="preview-wrap" style="display:none;margin-top:14px;">
-                <img id="preview-img" style="width:100%;border-radius:8px;max-height:200px;object-fit:cover;">
-            </div>
-
-            <button class="btn btn-primary"
-                    style="margin-top:14px;width:100%;"
-                    onclick="uploadFace()">
-                Register Face
-            </button>
-
-            <div id="upload-message" style="margin-top:10px;font-size:13px;"></div>
-        </div>
-
-        <!-- Registered faces -->
-        <div class="card">
-            <div class="card-title">Registered Faces</div>
-
-            {% if faces %}
-            <div class="faces-grid">
-                {% for face in faces %}
-                <div class="face-card" id="face-{{ face }}">
-                    <img src="/registered_faces/{{ face }}" alt="{{ face }}">
-                    <div class="face-name">{{ face }}</div>
-                    <button class="btn btn-danger btn-sm"
-                            onclick="deleteFace('{{ face }}')">
-                        Delete
-                    </button>
+    <!-- Child Tab -->
+    <div id="tab-child">
+        <div class="grid-2">
+            <div class="card">
+                <div class="card-title">Register Child</div>
+                <p style="font-size:13px;color:#8b949e;margin-bottom:14px;">
+                    The child's photo will be used for position tracking
+                    and inactivity detection. Only one child should be
+                    registered.
+                </p>
+                <div class="form-group">
+                    <label>Child Name</label>
+                    <input type="text" id="child-label"
+                           placeholder="e.g. Aisha">
                 </div>
-                {% endfor %}
+                <div class="upload-area"
+                     onclick="document.getElementById('child-photo').click()">
+                    <p>Click to select child photo</p>
+                    <p style="font-size:12px;margin-top:6px;">
+                        Clear face photo — JPG or PNG
+                    </p>
+                </div>
+                <input type="file" id="child-photo"
+                       accept="image/*" style="display:none"
+                       onchange="previewPhoto(event,'child-preview')">
+                <div id="child-preview" style="display:none;margin-top:14px;">
+                    <img id="child-preview-img"
+                         style="width:100%;border-radius:8px;
+                                max-height:200px;object-fit:cover;">
+                </div>
+                <button class="btn btn-primary"
+                        style="margin-top:14px;width:100%;"
+                        onclick="uploadFace('child')">
+                    Register as Child
+                </button>
+                <div id="child-message"
+                     style="margin-top:10px;font-size:13px;"></div>
             </div>
-            {% else %}
-            <p style="color:#8b949e;font-size:13px;">
-                No faces registered yet.
-            </p>
-            {% endif %}
-        </div>
 
+            <div class="card">
+                <div class="card-title">Registered Child</div>
+                {% if child_faces %}
+                <div class="faces-grid">
+                    {% for face in child_faces %}
+                    <div class="face-card" id="child-{{ face }}">
+                        <img src="/registered_faces/child/{{ face }}"
+                             alt="{{ face }}">
+                        <div class="face-name">{{ face }}</div>
+                        <button class="btn btn-danger btn-sm"
+                                onclick="deleteFace('child','{{ face }}')">
+                            Delete
+                        </button>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <p style="color:#8b949e;font-size:13px;">
+                    No child registered yet.
+                </p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Trusted Tab -->
+    <div id="tab-trusted" style="display:none;">
+        <div class="grid-2">
+            <div class="card">
+                <div class="card-title">Register Trusted Member</div>
+                <p style="font-size:13px;color:#8b949e;margin-bottom:14px;">
+                    Trusted members are identified as Authorized.
+                    Register the maid, family members, or regular
+                    visitors here.
+                </p>
+                <div class="form-group">
+                    <label>Member Name</label>
+                    <input type="text" id="trusted-label"
+                           placeholder="e.g. Maid, Grandma, Dad">
+                </div>
+                <div class="upload-area"
+                     onclick="document.getElementById('trusted-photo').click()">
+                    <p>Click to select photo</p>
+                    <p style="font-size:12px;margin-top:6px;">
+                        JPG or PNG
+                    </p>
+                </div>
+                <input type="file" id="trusted-photo"
+                       accept="image/*" style="display:none"
+                       onchange="previewPhoto(event,'trusted-preview')">
+                <div id="trusted-preview"
+                     style="display:none;margin-top:14px;">
+                    <img id="trusted-preview-img"
+                         style="width:100%;border-radius:8px;
+                                max-height:200px;object-fit:cover;">
+                </div>
+                <button class="btn btn-primary"
+                        style="margin-top:14px;width:100%;"
+                        onclick="uploadFace('trusted')">
+                    Register as Trusted Member
+                </button>
+                <div id="trusted-message"
+                     style="margin-top:10px;font-size:13px;"></div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Registered Trusted Members</div>
+                {% if trusted_faces %}
+                <div class="faces-grid">
+                    {% for face in trusted_faces %}
+                    <div class="face-card" id="trusted-{{ face }}">
+                        <img src="/registered_faces/trusted/{{ face }}"
+                             alt="{{ face }}">
+                        <div class="face-name">{{ face }}</div>
+                        <button class="btn btn-danger btn-sm"
+                                onclick="deleteFace('trusted','{{ face }}')">
+                            Delete
+                        </button>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <p style="color:#8b949e;font-size:13px;">
+                    No trusted members registered yet.
+                </p>
+                {% endif %}
+            </div>
+        </div>
     </div>
 </div>
 
 <script>
-    let selectedFile = null;
+    let selectedFiles = { child: null, trusted: null };
 
-    function previewPhoto(event) {
-        selectedFile = event.target.files[0];
-        if (!selectedFile) return;
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            document.getElementById("preview-img").src = e.target.result;
-            document.getElementById("preview-wrap").style.display = "block";
-        };
-        reader.readAsDataURL(selectedFile);
+    function showTab(tab) {
+        document.getElementById("tab-child").style.display =
+            tab === "child" ? "block" : "none";
+        document.getElementById("tab-trusted").style.display =
+            tab === "trusted" ? "block" : "none";
+        document.getElementById("tab-child-btn").className =
+            tab === "child" ? "btn btn-primary" : "btn btn-secondary";
+        document.getElementById("tab-trusted-btn").className =
+            tab === "trusted" ? "btn btn-primary" : "btn btn-secondary";
     }
 
-    function uploadFace() {
-        if (!selectedFile) {
+    function previewPhoto(event, previewId) {
+        const file = event.target.files[0];
+        if (!file) return;
+        const category = previewId.includes("child") ? "child" : "trusted";
+        selectedFiles[category] = file;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            document.getElementById(previewId + "-img").src = e.target.result;
+            document.getElementById(previewId).style.display = "block";
+        };
+        reader.readAsDataURL(file);
+    }
+
+    function uploadFace(category) {
+        const file = selectedFiles[category];
+        if (!file) {
             alert("Please select a photo first.");
             return;
         }
-        const label = document.getElementById("label-input").value || "person";
+        const label = document.getElementById(category + "-label").value
+                      || category;
         const formData = new FormData();
-        formData.append("photo", selectedFile);
+        formData.append("photo", file);
         formData.append("label", label);
+        formData.append("category", category);
 
         fetch("/upload_face", { method: "POST", body: formData })
             .then(r => r.json())
             .then(data => {
-                const msg = document.getElementById("upload-message");
+                const msg = document.getElementById(category + "-message");
                 msg.textContent = data.message;
                 msg.style.color = data.success ? "#3fb950" : "#f85149";
                 if (data.success) setTimeout(() => location.reload(), 1000);
             });
     }
 
-    function deleteFace(filename) {
+    function deleteFace(category, filename) {
         if (!confirm("Delete this registered face?")) return;
-        fetch(`/delete_face/${filename}`, { method: "POST" })
+        fetch(`/delete_face/${category}/${filename}`, { method: "POST" })
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    document.getElementById(`face-${filename}`).remove();
+                    document.getElementById(
+                        category + "-" + filename
+                    ).remove();
                 }
             });
     }
 </script>
-
 </body>
 </html>
