@@ -7,3 +7,6 @@ registered_faces/
 *.png
 *.jpeg
 .deepface/
+*.bak
+*.log
+.lgd-nfy0

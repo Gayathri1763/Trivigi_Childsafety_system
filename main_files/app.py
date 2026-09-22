@@ -8,6 +8,9 @@ from flask import (Flask, render_template, Response,
                    request, jsonify, send_from_directory)
 from flask_socketio import SocketIO
 
+import gpio_devices
+import servo_control
+
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*",
                     async_mode="threading")
@@ -421,6 +424,19 @@ def camera_loop():
                            ZONE_RADIUS,
                            (0, 200, 255), 1)
 
+            # ── Servo edge-tracking ─────────────────────────────────
+            # Recentres the camera only when the child nears a frame
+            # edge — never rotates continuously. See servo_control.py.
+            child_box = (person_boxes[child_box_idx]
+                         if child_box_idx is not None else None)
+            servo_control.update(
+                child_box,
+                clean_frame.shape[1],
+                lambda: add_alert(
+                    "CHILD_NOT_VISIBLE",
+                    "Child not visible — please check")
+            )
+
             # Count — exclude recognized child from total
             child_count  = 1 if child_box_idx is not None else 0
             other_count  = total - child_count
@@ -593,8 +609,41 @@ def handle_connect():
 
 
 if __name__ == "__main__":
+
+    # ── SOS button + ultrasonic proximity ────────────────────────
+    def snapshot_current_frame(label):
+        with frame_lock:
+            frame = (current_frame.copy()
+                     if current_frame is not None else None)
+        return take_snapshot(label, frame) if frame is not None else None
+
+    def on_sos_press():
+        snap = snapshot_current_frame("sos")
+        add_alert("SOS",
+                  "SOS button pressed — immediate attention required",
+                  snap, cooldown=0)
+
+    def on_proximity(distance_m):
+        snap = snapshot_current_frame("proximity")
+        add_alert("PROXIMITY",
+                  f"Person within {distance_m:.2f}m of camera", snap)
+
+    gpio_devices.start_sos_button(on_sos_press)
+    gpio_devices.start_ultrasonic_monitor(on_proximity)
+
+    # ── Ngrok remote access ───────────────────────────────────────
+    # Needs an authtoken configured once via:
+    #   ngrok config add-authtoken <token>
+    try:
+        from pyngrok import ngrok
+        public_url = ngrok.connect(5000, "http")
+        print(f"[INFO] Ngrok tunnel live at {public_url}")
+    except Exception as e:
+        print(f"[WARN] Ngrok tunnel not started: {e}")
+
     t = threading.Thread(target=camera_loop, daemon=True)
     t.start()
     print("Trivigi running → http://localhost:5000")
     socketio.run(app, host="0.0.0.0",
-                 port=5000, debug=False)
+                 port=5000, debug=False,
+                 allow_unsafe_werkzeug=True)

@@ -1,0 +1,15 @@
+[Unit]
+Description=Trivigi Child Safety Monitoring System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gayathri
+WorkingDirectory=/home/gayathri/Trivigi_Childsafety_system/main_files
+ExecStart=/usr/bin/python3 /home/gayathri/Trivigi_Childsafety_system/main_files/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
