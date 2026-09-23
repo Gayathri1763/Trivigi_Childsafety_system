@@ -451,16 +451,31 @@ def camera_loop():
                 # Crop from CLEAN (unannotated) frame
                 crop = clean_frame[fy1:fy2, fx1:fx2].copy()
 
-                # Match this face to nearest YOLO person box, then use
-                # THAT box's persistent track_id — not its position in
-                # this frame's list — as the classification key.
+                # Match this face to the YOLO person box whose center
+                # it's nearest to — but ONLY among boxes that actually
+                # CONTAIN the face (with a small tolerance for the
+                # Haar cascade's imprecise edges). Nearest-centroid
+                # alone, with no containment check, let a face near
+                # the boundary between two adjacent people (e.g. two
+                # registered family members standing close together)
+                # get attributed to the WRONG person's track_id purely
+                # because it was centroid-closer to their neighbour —
+                # misclassifying one as the other while starving the
+                # real match of any face at all. A face that isn't
+                # inside anyone's box this cycle is skipped rather
+                # than guessed — it's retried on the next pass.
                 face_cx = fx + fw // 2
                 face_cy = fy + fh // 2
+                tol_x   = int(fw * 0.3)
+                tol_y   = int(fh * 0.3)
 
                 best_idx  = None
                 best_dist = 999999
                 for p_idx, (x1, y1, x2, y2) in \
                         enumerate(person_boxes):
+                    if not (x1 - tol_x <= face_cx <= x2 + tol_x and
+                            y1 - tol_y <= face_cy <= y2 + tol_y):
+                        continue
                     box_cx = (x1 + x2) // 2
                     box_cy = (y1 + y2) // 2
                     d = ((face_cx - box_cx) ** 2 +
