@@ -185,7 +185,7 @@ def verify_folder(face_rgb_array, folder):
 
 
 def classify_face_worker(track_id, face_crop_bgr,
-                         clean_frame_copy, first_seen):
+                         clean_frame_copy, first_seen, mode):
     """
     Classifies one face crop.
     face_crop_bgr must be from the CLEAN unannotated frame.
@@ -203,6 +203,12 @@ def classify_face_worker(track_id, face_crop_bgr,
     with no clear read. A genuine CHILD/AUTHORIZED/UNAUTHORIZED match
     is written immediately — the grace window only applies to "can't
     tell yet".
+
+    mode is the camera mode at submission time. Child-mode tracking
+    (zone/inactivity/servo) doesn't apply in infant mode — infant mode
+    watches the infant, and the registered "child" is just another
+    known family member there — so a CHILD_DIR match reads as
+    AUTHORIZED instead of CHILD whenever mode is "infant".
     """
     global face_check_running
     timed_out = (time.time() - first_seen) >= FACE_CHECK_TIMEOUT_S
@@ -221,7 +227,7 @@ def classify_face_worker(track_id, face_crop_bgr,
         else:
             child_match = verify_folder(face_rgb, CHILD_DIR)
             if child_match is True:
-                result = "CHILD"
+                result = "AUTHORIZED" if mode == "infant" else "CHILD"
             else:
                 trusted_match = verify_folder(face_rgb, TRUSTED_DIR)
                 if trusted_match is True:
@@ -477,7 +483,8 @@ def camera_loop():
                         best_track_id,
                         crop,
                         clean_frame.copy(),  # clean snapshot
-                        first_seen
+                        first_seen,
+                        mode
                     )
 
         # ── No face ever found for this person ─────────────────────
