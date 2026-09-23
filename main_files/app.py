@@ -50,9 +50,11 @@ last_alert_time    = {}
 # caused the "child" label to jump onto a stranger. A track_id follows
 # the same physical person across frames instead.
 face_results        = {}
+face_first_seen     = {}   # track_id -> time.time() first submitted for classification
 face_results_lock   = threading.Lock()
 face_check_running  = set()
-FACE_RESULTS_MAX    = 2000   # safety cap for very long-running sessions
+FACE_RESULTS_MAX     = 2000   # safety cap for very long-running sessions
+FACE_CHECK_TIMEOUT_S = 10     # grace window before an inconclusive read gives up
 
 
 # ── Settings ───────────────────────────────────────────────────────
@@ -180,7 +182,7 @@ def verify_folder(face_rgb_array, folder):
 
 
 def classify_face_worker(track_id, face_crop_bgr,
-                         clean_frame_copy):
+                         clean_frame_copy, first_seen):
     """
     Classifies one face crop.
     face_crop_bgr must be from the CLEAN unannotated frame.
@@ -188,11 +190,24 @@ def classify_face_worker(track_id, face_crop_bgr,
     track_id is the YOLO/ByteTrack persistent id for this person —
     NOT their position in any single frame's box list — so the result
     stays attached to the same physical person across frames.
+
+    first_seen is when track_id first entered the classification
+    pipeline. A single bad-angle or motion-blurred frame shouldn't
+    brand someone UNIDENTIFIED — an inconclusive read (no reference
+    photos to compare against, or DeepFace erroring) leaves the
+    person at "CHECKING" and gets retried on the next cycle, only
+    finalising to UNIDENTIFIED once FACE_CHECK_TIMEOUT_S has passed
+    with no clear read. A genuine CHILD/AUTHORIZED/UNAUTHORIZED match
+    is written immediately — the grace window only applies to "can't
+    tell yet".
     """
     global face_check_running
+    timed_out = (time.time() - first_seen) >= FACE_CHECK_TIMEOUT_S
     try:
         # Convert to RGB for DeepFace
         face_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
+
+        result = None   # None = still inconclusive, try again next cycle
 
         if is_covered(face_crop_bgr):
             result = "UNIDENTIFIED"
@@ -208,33 +223,42 @@ def classify_face_worker(track_id, face_crop_bgr,
                 trusted_match = verify_folder(face_rgb, TRUSTED_DIR)
                 if trusted_match is True:
                     result = "AUTHORIZED"
-                elif child_match is None or trusted_match is None:
-                    # Could not be compared against either reference
-                    # set at all — not the same as a confirmed
-                    # non-match, so this must not read as unauthorized.
-                    result = "UNIDENTIFIED"
-                    add_alert(
-                        "UNIDENTIFIED",
-                        "Could not verify identity — flagged for review",
-                        clean_frame_copy)
-                else:
+                elif child_match is False and trusted_match is False:
+                    # Actually compared against both reference sets,
+                    # matched neither — a clear result, no need to
+                    # wait out the grace window.
                     result = "UNAUTHORIZED"
                     add_alert("UNAUTHORIZED",
                               "Unauthorized person detected",
                               clean_frame_copy)
+                elif timed_out:
+                    # Still not clear after the full grace window —
+                    # no reference photos to compare against, or every
+                    # DeepFace attempt errored the whole time.
+                    result = "UNIDENTIFIED"
+                    add_alert(
+                        "UNIDENTIFIED",
+                        f"Could not verify identity within "
+                        f"{FACE_CHECK_TIMEOUT_S}s — flagged for review",
+                        clean_frame_copy)
+                # else: leave result as None, still within the grace
+                # window — retried automatically on the next cycle.
 
-        with face_results_lock:
-            face_results[track_id] = result
-            if len(face_results) > FACE_RESULTS_MAX:
-                face_results.clear()
+        if result is not None:
+            with face_results_lock:
+                face_results[track_id] = result
+                if len(face_results) > FACE_RESULTS_MAX:
+                    face_results.clear()
+                    face_first_seen.clear()
 
     except Exception as e:
         print(f"[ERROR] classify_face_worker track_id={track_id}: {e}")
-        with face_results_lock:
-            face_results[track_id] = "UNIDENTIFIED"
-        add_alert("UNIDENTIFIED",
-                  "Face classification failed — flagged for review",
-                  clean_frame_copy)
+        if timed_out:
+            with face_results_lock:
+                face_results[track_id] = "UNIDENTIFIED"
+            add_alert("UNIDENTIFIED",
+                      "Face classification failed — flagged for review",
+                      clean_frame_copy)
     finally:
         face_check_running.discard(track_id)
 
@@ -322,6 +346,7 @@ def camera_loop():
             person_track_ids = []
             with face_results_lock:
                 face_results.clear()
+                face_first_seen.clear()
             face_check_running.clear()
             last_child_pos   = None
             inactivity_start = None
@@ -423,12 +448,16 @@ def camera_loop():
 
                 if best_track_id is not None and \
                    best_track_id not in face_check_running:
+                    with face_results_lock:
+                        first_seen = face_first_seen.setdefault(
+                            best_track_id, time.time())
                     face_check_running.add(best_track_id)
                     executor.submit(
                         classify_face_worker,
                         best_track_id,
                         crop,
-                        clean_frame.copy()   # clean snapshot
+                        clean_frame.copy(),  # clean snapshot
+                        first_seen
                     )
 
         # ── Draw boxes on display_frame ────────────────────────────
