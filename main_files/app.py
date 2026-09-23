@@ -37,14 +37,22 @@ DEFAULT_SETTINGS = {
 
 # ── Shared state ───────────────────────────────────────────────────
 alerts_log         = []
+ALERTS_LOG_MAX     = 500
 current_frame      = None
+current_frame_jpeg = None
 frame_lock         = threading.Lock()
 last_child_pos     = None
 inactivity_start   = None
 last_alert_time    = {}
-face_results       = {}
-face_results_lock  = threading.Lock()
-face_check_running = set()
+# Keyed by YOLO/ByteTrack persistent track_id — NOT by a box's position
+# in the current frame's list. Positional indices are unstable frame to
+# frame (a new person entering can reshuffle the list), which is what
+# caused the "child" label to jump onto a stranger. A track_id follows
+# the same physical person across frames instead.
+face_results        = {}
+face_results_lock   = threading.Lock()
+face_check_running  = set()
+FACE_RESULTS_MAX    = 2000   # safety cap for very long-running sessions
 
 
 # ── Settings ───────────────────────────────────────────────────────
@@ -71,12 +79,24 @@ def take_snapshot(label, frame):
     return filename
 
 
-def add_alert(alert_type, message, snapshot=None, cooldown=5):
+def add_alert(alert_type, message, frame=None, cooldown=5,
+              snapshot_label=None):
+    """
+    frame is the raw frame to snapshot — NOT a pre-taken snapshot.
+    The snapshot is only captured if this call actually passes the
+    cooldown check, so a suppressed repeat alert never touches disk.
+    """
     now = time.time()
     if alert_type in last_alert_time and \
        (now - last_alert_time[alert_type]) < cooldown:
         return
     last_alert_time[alert_type] = now
+
+    snapshot = None
+    if frame is not None:
+        snapshot = take_snapshot(
+            snapshot_label or alert_type.lower(), frame)
+
     item = {
         "type":     alert_type,
         "message":  message,
@@ -85,6 +105,8 @@ def add_alert(alert_type, message, snapshot=None, cooldown=5):
         "resolved": None
     }
     alerts_log.append(item)
+    if len(alerts_log) > ALERTS_LOG_MAX:
+        del alerts_log[:-ALERTS_LOG_MAX]
     socketio.emit("new_alert", item)
 
 
@@ -127,11 +149,18 @@ def verify_folder(face_rgb_array, folder):
     Passes RGB numpy array directly to DeepFace — avoids
     file I/O errors and BGR/RGB colour space confusion.
     Uses ArcFace with standard cosine distance threshold 0.68.
+
+    Returns True if matched, False if it was actually compared
+    against at least one reference photo and matched none, or None
+    if no comparison could be completed at all — no reference photos
+    registered, or every DeepFace attempt errored out. None must NOT
+    be treated as a confirmed non-match by the caller.
     """
     from deepface import DeepFace
     photos = get_photos(folder)
     if not photos:
-        return False
+        return None
+    attempted = False
     for photo in photos:
         try:
             res = DeepFace.verify(
@@ -142,19 +171,23 @@ def verify_folder(face_rgb_array, folder):
                 silent=True,
                 threshold=0.68
             )
+            attempted = True
             if res.get("verified", False):
                 return True
         except Exception:
             continue
-    return False
+    return False if attempted else None
 
 
-def classify_face_worker(person_idx, face_crop_bgr,
+def classify_face_worker(track_id, face_crop_bgr,
                          clean_frame_copy):
     """
     Classifies one face crop.
     face_crop_bgr must be from the CLEAN unannotated frame.
     clean_frame_copy used only for snapshots.
+    track_id is the YOLO/ByteTrack persistent id for this person —
+    NOT their position in any single frame's box list — so the result
+    stays attached to the same physical person across frames.
     """
     global face_check_running
     try:
@@ -163,36 +196,52 @@ def classify_face_worker(person_idx, face_crop_bgr,
 
         if is_covered(face_crop_bgr):
             result = "UNIDENTIFIED"
-            snap   = take_snapshot("unidentified", clean_frame_copy)
             add_alert("UNIDENTIFIED",
-                      "Covered face — flagged suspicious", snap)
-
-        elif verify_folder(face_rgb, CHILD_DIR):
-            result = "CHILD"
-
-        elif verify_folder(face_rgb, TRUSTED_DIR):
-            result = "AUTHORIZED"
+                      "Covered face — flagged suspicious",
+                      clean_frame_copy)
 
         else:
-            result = "UNAUTHORIZED"
-            snap   = take_snapshot("unauthorized", clean_frame_copy)
-            add_alert("UNAUTHORIZED",
-                      "Unauthorized person detected", snap)
+            child_match = verify_folder(face_rgb, CHILD_DIR)
+            if child_match is True:
+                result = "CHILD"
+            else:
+                trusted_match = verify_folder(face_rgb, TRUSTED_DIR)
+                if trusted_match is True:
+                    result = "AUTHORIZED"
+                elif child_match is None or trusted_match is None:
+                    # Could not be compared against either reference
+                    # set at all — not the same as a confirmed
+                    # non-match, so this must not read as unauthorized.
+                    result = "UNIDENTIFIED"
+                    add_alert(
+                        "UNIDENTIFIED",
+                        "Could not verify identity — flagged for review",
+                        clean_frame_copy)
+                else:
+                    result = "UNAUTHORIZED"
+                    add_alert("UNAUTHORIZED",
+                              "Unauthorized person detected",
+                              clean_frame_copy)
 
         with face_results_lock:
-            face_results[person_idx] = result
+            face_results[track_id] = result
+            if len(face_results) > FACE_RESULTS_MAX:
+                face_results.clear()
 
     except Exception as e:
-        print(f"[ERROR] classify_face_worker idx={person_idx}: {e}")
+        print(f"[ERROR] classify_face_worker track_id={track_id}: {e}")
         with face_results_lock:
-            face_results[person_idx] = "UNAUTHORIZED"
+            face_results[track_id] = "UNIDENTIFIED"
+        add_alert("UNIDENTIFIED",
+                  "Face classification failed — flagged for review",
+                  clean_frame_copy)
     finally:
-        face_check_running.discard(person_idx)
+        face_check_running.discard(track_id)
 
 
 # ── Camera loop ────────────────────────────────────────────────────
 def camera_loop():
-    global current_frame, last_child_pos, inactivity_start
+    global current_frame, current_frame_jpeg, last_child_pos, inactivity_start
 
     from ultralytics import YOLO
     from picamera2 import Picamera2
@@ -226,6 +275,20 @@ def camera_loop():
         cascade = None
 
     frame_idx = 0
+    last_frame_time = time.time()
+    fps_smoothed = 0.0
+
+    # NOTE: YOLO used to be throttled to every other frame to save CPU,
+    # but that broke ByteTrack identity continuity — skipping frames
+    # doubles the apparent motion between track() calls, so a moving
+    # child would frequently get reassigned a brand new track_id. A
+    # fresh id has no classification yet, so the servo would see
+    # child_box=None and start "scanning for lost child" even though
+    # the child never left frame. Running track() every frame trades
+    # some CPU for correct, continuous tracking.
+    YOLO_EVERY_N_FRAMES = 1
+    person_boxes     = []
+    person_track_ids = []   # parallel list — track_ids[i] identifies person_boxes[i]
 
     while True:
         settings  = load_settings()
@@ -240,15 +303,26 @@ def camera_loop():
 
         frame_idx += 1
 
+        now_ts = time.time()
+        frame_dt = now_ts - last_frame_time
+        last_frame_time = now_ts
+        if frame_dt > 0:
+            instant_fps  = 1.0 / frame_dt
+            fps_smoothed = (instant_fps if fps_smoothed == 0
+                            else fps_smoothed * 0.9 + instant_fps * 0.1)
+
         # Mode change → restart camera
         if mode != last_mode:
             picam2.stop()
             picam2.close()
             picam2    = start_cam(mode)
             last_mode = mode
-            frame_idx = 0
+            frame_idx        = 0
+            person_boxes     = []
+            person_track_ids = []
             with face_results_lock:
                 face_results.clear()
+            face_check_running.clear()
             last_child_pos   = None
             inactivity_start = None
             continue
@@ -260,6 +334,11 @@ def camera_loop():
         clean_frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
         display_frame = clean_frame.copy()
 
+        cv2.putText(display_frame, f"FPS: {fps_smoothed:.1f}",
+                    (display_frame.shape[1] - 120, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 255), 2)
+
         # ── Low light check ────────────────────────────────────────
         if cv2.cvtColor(clean_frame,
                         cv2.COLOR_BGR2GRAY).mean() < 50:
@@ -268,20 +347,39 @@ def camera_loop():
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7, (0, 0, 255), 2)
             add_alert("LOW_LIGHT", "Room too dark")
+            ok, jpeg_buf = cv2.imencode(
+                ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             with frame_lock:
                 current_frame = display_frame.copy()
+                if ok:
+                    current_frame_jpeg = jpeg_buf.tobytes()
             time.sleep(0.05)
             continue
 
-        # ── YOLO on clean frame ────────────────────────────────────
-        results      = yolo(clean_frame, verbose=False,
-                            imgsz=320, conf=0.5, iou=0.45)
-        person_boxes = []
-        for r in results:
-            for b in r.boxes:
-                if int(b.cls[0]) == 0:
+        # ── YOLO + ByteTrack on clean frame ─────────────────────────
+        # Throttled to every Nth frame — see YOLO_EVERY_N_FRAMES above.
+        # .track(persist=True) assigns a stable track_id to each person
+        # that follows them across frames, instead of a raw per-frame
+        # detection list whose ORDER can reshuffle the instant someone
+        # else enters frame. Classification results are keyed by that
+        # track_id (see classify_face_worker / face_results below), so
+        # a new person appearing can no longer make the "CHILD" label
+        # jump onto the wrong box.
+        if frame_idx % YOLO_EVERY_N_FRAMES == 0:
+            results = yolo.track(clean_frame, verbose=False,
+                                 imgsz=320, conf=0.5, iou=0.45,
+                                 persist=True, tracker="bytetrack.yaml")
+            person_boxes     = []
+            person_track_ids = []
+            for r in results:
+                ids = r.boxes.id
+                for i, b in enumerate(r.boxes):
+                    if int(b.cls[0]) != 0:
+                        continue
                     x1, y1, x2, y2 = map(int, b.xyxy[0])
+                    tid = int(ids[i]) if ids is not None else None
                     person_boxes.append((x1, y1, x2, y2))
+                    person_track_ids.append(tid)
 
         total = len(person_boxes)
 
@@ -302,7 +400,9 @@ def camera_loop():
                 # Crop from CLEAN (unannotated) frame
                 crop = clean_frame[fy1:fy2, fx1:fx2].copy()
 
-                # Match this face to nearest YOLO person box
+                # Match this face to nearest YOLO person box, then use
+                # THAT box's persistent track_id — not its position in
+                # this frame's list — as the classification key.
                 face_cx = fx + fw // 2
                 face_cy = fy + fh // 2
 
@@ -318,12 +418,15 @@ def camera_loop():
                         best_dist = d
                         best_idx  = p_idx
 
-                if best_idx is not None and \
-                   best_idx not in face_check_running:
-                    face_check_running.add(best_idx)
+                best_track_id = (person_track_ids[best_idx]
+                                 if best_idx is not None else None)
+
+                if best_track_id is not None and \
+                   best_track_id not in face_check_running:
+                    face_check_running.add(best_track_id)
                     executor.submit(
                         classify_face_worker,
-                        best_idx,
+                        best_track_id,
                         crop,
                         clean_frame.copy()   # clean snapshot
                     )
@@ -334,7 +437,9 @@ def camera_loop():
             results_snap = dict(face_results)
 
         for p_idx, (x1, y1, x2, y2) in enumerate(person_boxes):
-            result = results_snap.get(p_idx, "CHECKING")
+            tid    = person_track_ids[p_idx]
+            result = (results_snap.get(tid, "CHECKING")
+                      if tid is not None else "CHECKING")
 
             if result == "CHILD":
                 color = (0, 255, 0)
@@ -410,11 +515,9 @@ def camera_loop():
                                     0.7, (255, 165, 0), 2)
 
                         if secs >= inact_sec:
-                            snap = take_snapshot(
-                                "inactivity", clean_frame)
                             add_alert("INACTIVITY",
                                       "Child has not changed position",
-                                      snap)
+                                      clean_frame)
                             inactivity_start = time.time()
 
                 # Draw zone circle on display_frame
@@ -424,14 +527,42 @@ def camera_loop():
                            ZONE_RADIUS,
                            (0, 200, 255), 1)
 
-            # ── Servo edge-tracking ─────────────────────────────────
-            # Recentres the camera only when the child nears a frame
-            # edge — never rotates continuously. See servo_control.py.
+            # ── Servo tracking ──────────────────────────────────────
+            # Tracks the child's FACE, not just their body box centre,
+            # so framing stays on the face as they move. Face detection
+            # here runs on a small crop of just the child's body box —
+            # cheap enough to do every frame (unlike the full-frame
+            # cascade pass above, which is throttled). Falls back to
+            # the body box when no face is found this frame (e.g. the
+            # child has turned away), so tracking doesn't drop out.
             child_box = (person_boxes[child_box_idx]
                          if child_box_idx is not None else None)
+
+            child_track_box = child_box
+            if child_box is not None and cascade is not None:
+                bx1, by1, bx2, by2 = child_box
+                bx1c = max(0, bx1)
+                by1c = max(0, by1)
+                bx2c = min(clean_frame.shape[1], bx2)
+                by2c = min(clean_frame.shape[0], by2)
+                if bx2c > bx1c and by2c > by1c:
+                    crop_gray = cv2.cvtColor(
+                        clean_frame[by1c:by2c, bx1c:bx2c],
+                        cv2.COLOR_BGR2GRAY)
+                    faces_in_crop = cascade.detectMultiScale(
+                        crop_gray, 1.1, 4)
+                    if len(faces_in_crop) > 0:
+                        fx, fy, fw, fh = max(
+                            faces_in_crop, key=lambda f: f[2] * f[3])
+                        child_track_box = (
+                            bx1c + fx, by1c + fy,
+                            bx1c + fx + fw, by1c + fy + fh)
+
             servo_control.update(
-                child_box,
+                child_track_box,
                 clean_frame.shape[1],
+                clean_frame.shape[0],
+                total,
                 lambda: add_alert(
                     "CHILD_NOT_VISIBLE",
                     "Child not visible — please check")
@@ -442,10 +573,9 @@ def camera_loop():
             other_count  = total - child_count
             exp_others   = max(0, expected - 1)
             if other_count > exp_others:
-                snap = take_snapshot("count", clean_frame)
                 add_alert("COUNT_ALERT",
                           f"{other_count} extra persons detected",
-                          snap)
+                          clean_frame, snapshot_label="count")
 
         # ── Infant mode ────────────────────────────────────────────
         elif mode == "infant":
@@ -454,10 +584,9 @@ def camera_loop():
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7, (255, 255, 0), 2)
             if total > expected:
-                snap = take_snapshot("count", clean_frame)
                 add_alert("COUNT_ALERT",
                           f"{total} persons — expected {expected}",
-                          snap)
+                          clean_frame, snapshot_label="count")
 
         # ── HUD ───────────────────────────────────────────────────
         cv2.putText(display_frame,
@@ -467,8 +596,14 @@ def camera_loop():
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (255, 255, 255), 1)
 
+        # Encode once here — generate() just serves these cached bytes,
+        # so N connected viewers don't each re-encode the same frame.
+        ok, jpeg_buf = cv2.imencode(
+            ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         with frame_lock:
             current_frame = display_frame.copy()
+            if ok:
+                current_frame_jpeg = jpeg_buf.tobytes()
 
         time.sleep(0.03)
 
@@ -477,16 +612,10 @@ def camera_loop():
 def generate():
     while True:
         with frame_lock:
-            if current_frame is None:
-                time.sleep(0.05)
-                continue
-            ret, buf = cv2.imencode(
-                ".jpg", current_frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 70]
-            )
-            if not ret:
-                continue
-            data = buf.tobytes()
+            data = current_frame_jpeg
+        if data is None:
+            time.sleep(0.05)
+            continue
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n\r\n"
                + data + b"\r\n")
@@ -611,22 +740,20 @@ def handle_connect():
 if __name__ == "__main__":
 
     # ── SOS button + ultrasonic proximity ────────────────────────
-    def snapshot_current_frame(label):
+    def get_current_frame_copy():
         with frame_lock:
-            frame = (current_frame.copy()
-                     if current_frame is not None else None)
-        return take_snapshot(label, frame) if frame is not None else None
+            return (current_frame.copy()
+                    if current_frame is not None else None)
 
     def on_sos_press():
-        snap = snapshot_current_frame("sos")
         add_alert("SOS",
                   "SOS button pressed — immediate attention required",
-                  snap, cooldown=0)
+                  get_current_frame_copy(), cooldown=0)
 
     def on_proximity(distance_m):
-        snap = snapshot_current_frame("proximity")
         add_alert("PROXIMITY",
-                  f"Person within {distance_m:.2f}m of camera", snap)
+                  f"Person within {distance_m:.2f}m of camera",
+                  get_current_frame_copy())
 
     gpio_devices.start_sos_button(on_sos_press)
     gpio_devices.start_ultrasonic_monitor(on_proximity)
