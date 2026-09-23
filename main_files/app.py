@@ -313,6 +313,12 @@ def camera_loop():
     YOLO_EVERY_N_FRAMES = 1
     person_boxes     = []
     person_track_ids = []   # parallel list — track_ids[i] identifies person_boxes[i]
+    person_first_seen = {}  # track_id -> time.time() first seen as a person,
+                             # regardless of whether a face was ever found for
+                             # them — covers a face the cascade can't detect
+                             # at all (e.g. covered by a mask/shawl), which
+                             # would otherwise never reach classify_face_worker
+                             # and sit at "Checking..." forever.
 
     while True:
         settings  = load_settings()
@@ -342,8 +348,9 @@ def camera_loop():
             picam2    = start_cam(mode)
             last_mode = mode
             frame_idx        = 0
-            person_boxes     = []
-            person_track_ids = []
+            person_boxes      = []
+            person_track_ids  = []
+            person_first_seen = {}
             with face_results_lock:
                 face_results.clear()
                 face_first_seen.clear()
@@ -406,6 +413,13 @@ def camera_loop():
                     person_boxes.append((x1, y1, x2, y2))
                     person_track_ids.append(tid)
 
+            now_seen = time.time()
+            for tid in person_track_ids:
+                if tid is not None:
+                    person_first_seen.setdefault(tid, now_seen)
+            if len(person_first_seen) > FACE_RESULTS_MAX:
+                person_first_seen.clear()
+
         total = len(person_boxes)
 
         # ── Face recognition — crops from CLEAN frame ──────────────
@@ -459,6 +473,31 @@ def camera_loop():
                         clean_frame.copy(),  # clean snapshot
                         first_seen
                     )
+
+        # ── No face ever found for this person ─────────────────────
+        # The Haar cascade needs a visible mouth/nose/eyes region — a
+        # mask, shawl or hand over the lower face routinely means NO
+        # face is ever detected, so classify_face_worker never runs
+        # and is_covered() never gets a crop to inspect. Without this,
+        # that person sits at "Checking..." forever. Same grace window
+        # as an inconclusive classification (FACE_CHECK_TIMEOUT_S).
+        now = time.time()
+        for tid in person_track_ids:
+            if tid is None or tid in face_check_running:
+                continue
+            with face_results_lock:
+                already_resolved = tid in face_results
+            if already_resolved:
+                continue
+            started = person_first_seen.get(tid)
+            if started is not None and (now - started) >= FACE_CHECK_TIMEOUT_S:
+                with face_results_lock:
+                    face_results[tid] = "UNIDENTIFIED"
+                add_alert(
+                    "UNIDENTIFIED",
+                    f"No face detected for {FACE_CHECK_TIMEOUT_S}s — "
+                    "possibly covered — flagged for review",
+                    clean_frame)
 
         # ── Draw boxes on display_frame ────────────────────────────
         child_box_idx = None
