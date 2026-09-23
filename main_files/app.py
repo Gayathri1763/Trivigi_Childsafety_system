@@ -43,6 +43,8 @@ current_frame_jpeg = None
 frame_lock         = threading.Lock()
 last_child_pos     = None
 inactivity_start   = None
+child_absent_start      = None   # time.time() when the child was last seen present; None while present
+child_not_found_alerted = False  # fires CHILD_NOT_FOUND once per absence, not every frame
 last_alert_time    = {}
 # Keyed by YOLO/ByteTrack persistent track_id — NOT by a box's position
 # in the current frame's list. Positional indices are unstable frame to
@@ -55,6 +57,7 @@ face_results_lock   = threading.Lock()
 face_check_running  = set()
 FACE_RESULTS_MAX     = 2000   # safety cap for very long-running sessions
 FACE_CHECK_TIMEOUT_S = 10     # grace window before an inconclusive read gives up
+CHILD_NOT_FOUND_TIMEOUT_S = 10  # child mode: how long child can be absent before alerting
 
 
 # ── Settings ───────────────────────────────────────────────────────
@@ -266,6 +269,7 @@ def classify_face_worker(track_id, face_crop_bgr,
 # ── Camera loop ────────────────────────────────────────────────────
 def camera_loop():
     global current_frame, current_frame_jpeg, last_child_pos, inactivity_start
+    global child_absent_start, child_not_found_alerted
 
     from ultralytics import YOLO
     from picamera2 import Picamera2
@@ -357,6 +361,8 @@ def camera_loop():
             face_check_running.clear()
             last_child_pos   = None
             inactivity_start = None
+            child_absent_start      = None
+            child_not_found_alerted = False
             continue
 
         # ── Capture two versions of frame ──────────────────────────
@@ -536,28 +542,21 @@ def camera_loop():
         # ── Child mode — zone-based inactivity ─────────────────────
         if mode == "child":
 
-            # Find child position — prefer recognized child box
-            # Fall back to smallest box if not yet recognized
-            child_center = None
+            # Inactivity tracking only applies to the CONFIRMED child
+            # (child_box_idx) — no more falling back to "smallest box
+            # in frame". Tracking a stranger as a stand-in for the
+            # child was causing bogus inactivity alerts once the real
+            # child left frame while someone else remained.
             if child_box_idx is not None:
                 x1, y1, x2, y2 = person_boxes[child_box_idx]
-            elif person_boxes:
-                x1, y1, x2, y2 = min(
-                    person_boxes,
-                    key=lambda b: (b[2]-b[0]) * (b[3]-b[1])
-                )
-            else:
-                x1 = y1 = x2 = y2 = None
-
-            if x1 is not None:
                 # Use upper body center — less affected by arm movements
                 # Track point is at 1/3 from top of bounding box
                 cx = (x1 + x2) // 2
                 cy = y1 + (y2 - y1) // 3
-                child_center = (cx, cy)
 
-            if child_center:
-                cx, cy = child_center
+                # Child is present — clear the "not found" timer.
+                child_absent_start      = None
+                child_not_found_alerted = False
 
                 if last_child_pos is None:
                     # First time — set anchor
@@ -594,6 +593,31 @@ def camera_loop():
                            last_child_pos,
                            ZONE_RADIUS,
                            (0, 200, 255), 1)
+
+            else:
+                # Child not recognized as present this frame — pause
+                # inactivity tracking entirely (don't measure a
+                # stranger's stillness, and don't let a stale timer
+                # fire the instant the real child reappears), and time
+                # how long the child has been missing from view.
+                last_child_pos   = None
+                inactivity_start = None
+
+                if child_absent_start is None:
+                    child_absent_start = time.time()
+                else:
+                    absent_secs = time.time() - child_absent_start
+                    cv2.putText(display_frame,
+                                f"Child not found: {int(absent_secs)}s",
+                                (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (0, 0, 255), 2)
+                    if absent_secs >= CHILD_NOT_FOUND_TIMEOUT_S and \
+                       not child_not_found_alerted:
+                        child_not_found_alerted = True
+                        add_alert("CHILD_NOT_FOUND",
+                                  "Child not found",
+                                  clean_frame)
 
             # ── Servo tracking ──────────────────────────────────────
             # Tracks the child's FACE, not just their body box centre,
