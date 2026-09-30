@@ -42,7 +42,8 @@
                 {% if alert.snapshot %}
                 <img class="alert-snapshot"
                      src="/snapshots/{{ alert.snapshot }}"
-                     alt="snapshot">
+                     alt="snapshot"
+                     onclick="openLightbox('/snapshots/{{ alert.snapshot }}')">
                 {% else %}
                 <div class="alert-snapshot"
                      style="background:#21262d;display:flex;align-items:center;justify-content:center;">
@@ -86,12 +87,26 @@
     </div>
 </div>
 
+<div class="lightbox-overlay" id="lightbox" onclick="closeLightbox()">
+    <span class="lightbox-close">&times;</span>
+    <img id="lightbox-img" src="" alt="snapshot enlarged">
+</div>
+
 <script>
     const socket = io();
 
     socket.on("new_alert", (alert) => {
         location.reload();
     });
+
+    function openLightbox(src) {
+        document.getElementById("lightbox-img").src = src;
+        document.getElementById("lightbox").classList.add("open");
+    }
+
+    function closeLightbox() {
+        document.getElementById("lightbox").classList.remove("open");
+    }
 
     function resolveAlert(index, status, btn) {
         fetch("/resolve_alert", {

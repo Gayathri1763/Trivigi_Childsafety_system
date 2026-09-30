@@ -8,6 +8,8 @@ registered_faces/
 *.jpeg
 .deepface/
 *.bak
+*.bak*
+*.unused
 *.log
 .lgd-nfy0
 main_files/trivigi_bytetrack.yaml
