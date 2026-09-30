@@ -323,12 +323,56 @@ def camera_loop():
     YOLO_EVERY_N_FRAMES = 1
     person_boxes     = []
     person_track_ids = []   # parallel list — track_ids[i] identifies person_boxes[i]
+    person_confs     = []   # parallel list — detection confidence per box
     person_first_seen = {}  # track_id -> time.time() first seen as a person,
                              # regardless of whether a face was ever found for
                              # them — covers a face the cascade can't detect
                              # at all (e.g. covered by a mask/shawl), which
                              # would otherwise never reach classify_face_worker
                              # and sit at "Checking..." forever.
+
+    # ── Target lock (child-mode person tracking) ─────────────────────
+    # Three separate responsibilities, kept separate on purpose:
+    #   DETECTION  — is this a person at all?           (YOLO, above)
+    #   TRACKING   — same physical person as last frame? (ByteTrack track_id)
+    #   TARGET LOCK — which track_id do we keep following as "the child"?
+    # child classification (CHILD/AUTHORIZED/...) only ever PROPOSES a
+    # target while SEARCHING. Once LOCKED, the target is whichever box
+    # still carries target_track_id this frame — it is never re-picked
+    # from classification alone, so a stranger with a higher-confidence
+    # or larger box, or a stray misclassification elsewhere, can't
+    # silently steal the lock.
+    target_track_id      = None         # locked target's track_id, or None
+    target_state         = "SEARCHING"  # SEARCHING | CONFIRMING | LOCKED | TEMP_LOST
+    target_lost_frames   = 0            # consecutive frames the locked target went undetected
+    target_confirm_id    = None         # track_id currently accumulating CHILD confirmations
+    target_confirm_count = 0            # consecutive CHILD reads for target_confirm_id
+    target_last_box      = None         # locked target's last known box (for ID-switch sanity check)
+
+    # Tunable parameters — grouped here rather than as scattered magic
+    # numbers, per the requirement that these be configurable.
+    TARGET_CONFIRMATION_FRAMES = 5     # consecutive CHILD reads needed to lock a NEW target
+    TARGET_LOST_FRAMES         = 45    # frames the locked target may go undetected before release
+    MAX_TRACK_AGE              = 60    # frames ByteTrack keeps a lost track's id reusable (track_buffer)
+    MIN_TRACK_CONFIDENCE       = 0.5   # YOLO detection confidence floor, forwarded to track()
+    ID_SWITCH_JUMP_PX          = 150   # center jump (px) in one frame that trips a switch warning
+    ID_SWITCH_SIZE_RATIO       = 2.5   # box-area ratio change in one frame that trips the same warning
+
+    # ByteTrack's own config is a YAML file, not a Python literal —
+    # generate it from MAX_TRACK_AGE so that constant stays the single
+    # source of truth instead of a second, easily-forgotten copy.
+    tracker_cfg_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "trivigi_bytetrack.yaml")
+    with open(tracker_cfg_path, "w") as f:
+        f.write(
+            "tracker_type: bytetrack\n"
+            "track_high_thresh: 0.5\n"
+            "track_low_thresh: 0.1\n"
+            "new_track_thresh: 0.6\n"
+            f"track_buffer: {MAX_TRACK_AGE}\n"
+            "match_thresh: 0.8\n"
+            "fuse_score: True\n"
+        )
 
     while True:
         settings  = load_settings()
@@ -360,6 +404,7 @@ def camera_loop():
             frame_idx        = 0
             person_boxes      = []
             person_track_ids  = []
+            person_confs      = []
             person_first_seen = {}
             with face_results_lock:
                 face_results.clear()
@@ -369,6 +414,12 @@ def camera_loop():
             inactivity_start = None
             child_absent_start      = None
             child_not_found_alerted = False
+            target_track_id       = None
+            target_state          = "SEARCHING"
+            target_lost_frames    = 0
+            target_confirm_id     = None
+            target_confirm_count  = 0
+            target_last_box       = None
             continue
 
         # ── Capture two versions of frame ──────────────────────────
@@ -411,10 +462,12 @@ def camera_loop():
         # jump onto the wrong box.
         if frame_idx % YOLO_EVERY_N_FRAMES == 0:
             results = yolo.track(clean_frame, verbose=False,
-                                 imgsz=320, conf=0.5, iou=0.45,
-                                 persist=True, tracker="bytetrack.yaml")
+                                 imgsz=320, conf=MIN_TRACK_CONFIDENCE,
+                                 iou=0.45, persist=True,
+                                 tracker=tracker_cfg_path)
             person_boxes     = []
             person_track_ids = []
+            person_confs     = []
             for r in results:
                 ids = r.boxes.id
                 for i, b in enumerate(r.boxes):
@@ -424,6 +477,7 @@ def camera_loop():
                     tid = int(ids[i]) if ids is not None else None
                     person_boxes.append((x1, y1, x2, y2))
                     person_track_ids.append(tid)
+                    person_confs.append(float(b.conf[0]))
 
             now_seen = time.time()
             for tid in person_track_ids:
@@ -527,20 +581,126 @@ def camera_loop():
                     "possibly covered — flagged for review",
                     clean_frame)
 
-        # ── Draw boxes on display_frame ────────────────────────────
-        child_box_idx = None
+        # ── Target lock (child-mode person tracking) ────────────────
+        # See the constants/state block near the top of this function
+        # for the full rationale. Summary: classification only ever
+        # PROPOSES a target while SEARCHING/CONFIRMING; once LOCKED,
+        # child_box_idx comes ONLY from track_id continuity below.
         with face_results_lock:
             results_snap = dict(face_results)
 
+        child_box_idx = None
+
+        if mode == "child":
+            child_candidates = [
+                (p_idx, tid) for p_idx, tid in enumerate(person_track_ids)
+                if tid is not None and results_snap.get(tid) == "CHILD"
+            ]
+
+            if target_track_id is not None:
+                try:
+                    idx = person_track_ids.index(target_track_id)
+                except ValueError:
+                    idx = None
+
+                if idx is not None:
+                    box = person_boxes[idx]
+                    if target_last_box is not None:
+                        px1, py1, px2, py2 = target_last_box
+                        pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
+                        parea    = max(1, (px2 - px1) * (py2 - py1))
+                        bx1, by1, bx2, by2 = box
+                        bcx, bcy = (bx1 + bx2) / 2, (by1 + by2) / 2
+                        barea    = max(1, (bx2 - bx1) * (by2 - by1))
+                        jump       = ((bcx - pcx) ** 2 + (bcy - pcy) ** 2) ** 0.5
+                        size_ratio = max(barea / parea, parea / barea)
+                        if jump > ID_SWITCH_JUMP_PX or \
+                           size_ratio > ID_SWITCH_SIZE_RATIO:
+                            print(
+                                f"[WARN] Possible ID SWITCH suspected — "
+                                f"target ID {target_track_id} jumped "
+                                f"{jump:.0f}px / size changed "
+                                f"{size_ratio:.1f}x in one frame. "
+                                f"Target NOT switched automatically."
+                            )
+                    target_last_box     = box
+                    target_state        = "LOCKED"
+                    target_lost_frames  = 0
+                    child_box_idx       = idx
+                else:
+                    # Locked target not detected this frame — do NOT
+                    # hand the target to anyone else. Keep the id
+                    # alive for up to TARGET_LOST_FRAMES first.
+                    target_lost_frames += 1
+                    target_state = "TEMP_LOST"
+                    if target_lost_frames > TARGET_LOST_FRAMES:
+                        print(
+                            f"[INFO] Target ID {target_track_id} lost "
+                            f"for {target_lost_frames} frames — "
+                            f"releasing target, returning to SEARCHING."
+                        )
+                        target_track_id = None
+                        target_state    = "SEARCHING"
+                        target_last_box = None
+
+                # A different track_id also reading CHILD while we're
+                # still locked is logged for debugging, never switched to.
+                for _, cand_tid in child_candidates:
+                    if cand_tid != target_track_id:
+                        print(
+                            f"[WARN] Possible ID SWITCH — locked target "
+                            f"is ID {target_track_id}, but ID {cand_tid} "
+                            f"also classified CHILD this frame. Ignoring; "
+                            f"target stays ID {target_track_id}."
+                        )
+
+            else:
+                # SEARCHING/CONFIRMING — require TARGET_CONFIRMATION_FRAMES
+                # of CONSECUTIVE CHILD reads on the SAME track_id before
+                # locking, so one flickery misclassification (or two
+                # candidates alternating) can't grab the target.
+                if child_candidates:
+                    cand_idx, cand_tid = child_candidates[0]
+                    if cand_tid == target_confirm_id:
+                        target_confirm_count += 1
+                    else:
+                        target_confirm_id    = cand_tid
+                        target_confirm_count = 1
+
+                    if target_confirm_count >= TARGET_CONFIRMATION_FRAMES:
+                        target_track_id      = cand_tid
+                        target_state         = "LOCKED"
+                        target_lost_frames   = 0
+                        target_last_box      = person_boxes[cand_idx]
+                        child_box_idx        = cand_idx
+                        target_confirm_id    = None
+                        target_confirm_count = 0
+                        print(f"[INFO] TARGET LOCKED — ID {target_track_id}")
+                    else:
+                        target_state = "CONFIRMING"
+                else:
+                    target_confirm_id    = None
+                    target_confirm_count = 0
+                    target_state         = "SEARCHING"
+        else:
+            # Infant mode doesn't lock onto a specific person.
+            target_track_id      = None
+            target_state         = "SEARCHING"
+            target_lost_frames   = 0
+            target_confirm_id    = None
+            target_confirm_count = 0
+            target_last_box      = None
+
+        # ── Draw boxes on display_frame ────────────────────────────
         for p_idx, (x1, y1, x2, y2) in enumerate(person_boxes):
             tid    = person_track_ids[p_idx]
+            conf   = person_confs[p_idx] if p_idx < len(person_confs) else 0.0
             result = (results_snap.get(tid, "CHECKING")
                       if tid is not None else "CHECKING")
 
             if result == "CHILD":
                 color = (0, 255, 0)
                 label = "Child"
-                child_box_idx = p_idx
             elif result == "AUTHORIZED":
                 color = (0, 200, 255)
                 label = "Authorized"
@@ -554,12 +714,35 @@ def camera_loop():
                 color = (180, 180, 180)
                 label = "Checking..."
 
+            is_target = (mode == "child" and target_state == "LOCKED"
+                         and p_idx == child_box_idx)
+
             cv2.rectangle(display_frame,
-                          (x1, y1), (x2, y2), color, 2)
-            cv2.putText(display_frame, label,
+                          (x1, y1), (x2, y2), color,
+                          3 if is_target else 2)
+            if is_target:
+                # Extra outline makes the locked target unmistakable
+                # from every other box on screen.
+                cv2.rectangle(display_frame,
+                              (x1 - 3, y1 - 3), (x2 + 3, y2 + 3),
+                              (0, 255, 255), 2)
+
+            tag = f"{label} | ID:{tid if tid is not None else '?'} | {conf:.2f}"
+            if is_target:
+                tag += " | TARGET"
+            cv2.putText(display_frame, tag,
                         (x1, y1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, color, 2)
+                        0.55, color, 2)
+
+        if mode == "child":
+            cv2.putText(
+                display_frame,
+                f"TARGET: {'ID ' + str(target_track_id) if target_track_id is not None else 'NONE'}"
+                f" | TRACK STATUS: {target_state}",
+                (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 255, 255), 2)
 
         # ── Child mode — zone-based inactivity ─────────────────────
         if mode == "child":
