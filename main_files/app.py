@@ -218,9 +218,20 @@ def classify_face_worker(track_id, face_crop_bgr,
     false-positive face match, not a second child — it's treated as a
     non-match here and falls through to the trusted/unauthorized
     check, exactly like nobody-in-particular's face would.
+
+    If track_id IS the already-locked target, DeepFace is not
+    re-consulted at all — a single bad-angle or lighting frame that
+    fails to re-match must never demote the real, already-identified
+    child to UNAUTHORIZED and fire a false "unauthorized person"
+    alert. Identity comes from the lock (track_id continuity), not
+    from re-running recognition every cycle. is_covered() still runs
+    unconditionally either way — a covered face is a genuine, separate
+    safety signal, not a recognition-confidence question.
     """
     global face_check_running
     timed_out = (time.time() - first_seen) >= FACE_CHECK_TIMEOUT_S
+    is_locked_self = (locked_target_id is not None
+                       and locked_target_id == track_id)
     try:
         # Convert to RGB for DeepFace
         face_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
@@ -233,10 +244,12 @@ def classify_face_worker(track_id, face_crop_bgr,
                       "Covered face — flagged suspicious",
                       clean_frame_copy)
 
+        elif is_locked_self:
+            result = "AUTHORIZED" if mode == "infant" else "CHILD"
+
         else:
             child_match = verify_folder(face_rgb, CHILD_DIR)
-            if child_match is True and \
-               (locked_target_id is None or locked_target_id == track_id):
+            if child_match is True and locked_target_id is None:
                 result = "AUTHORIZED" if mode == "infant" else "CHILD"
             else:
                 if child_match is True:
@@ -734,6 +747,14 @@ def camera_loop():
                and tid != target_track_id:
                 result = "UNAUTHORIZED"
 
+            # The locked target always displays as Child — identity
+            # comes from the lock itself (track_id continuity), not
+            # from whatever the last cached classification happened
+            # to be, so a transient miss can never flicker their own
+            # box away from Child either.
+            if is_target:
+                result = "CHILD"
+
             if result == "CHILD":
                 color = (0, 255, 0)
                 label = "Child"
@@ -760,22 +781,13 @@ def camera_loop():
                               (x1 - 3, y1 - 3), (x2 + 3, y2 + 3),
                               (0, 255, 255), 2)
 
-            tag = f"{label} | ID:{tid if tid is not None else '?'} | {conf:.2f}"
+            tag = f"{label} | {conf:.2f}"
             if is_target:
                 tag += " | TARGET"
             cv2.putText(display_frame, tag,
                         (x1, y1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, color, 2)
-
-        if mode == "child":
-            cv2.putText(
-                display_frame,
-                f"TARGET: {'ID ' + str(target_track_id) if target_track_id is not None else 'NONE'}"
-                f" | TRACK STATUS: {target_state}",
-                (10, 90),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 255, 255), 2)
 
         # ── Child mode — zone-based inactivity ─────────────────────
         if mode == "child":
