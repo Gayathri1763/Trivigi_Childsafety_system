@@ -185,7 +185,8 @@ def verify_folder(face_rgb_array, folder):
 
 
 def classify_face_worker(track_id, face_crop_bgr,
-                         clean_frame_copy, first_seen, mode):
+                         clean_frame_copy, first_seen, mode,
+                         locked_target_id):
     """
     Classifies one face crop.
     face_crop_bgr must be from the CLEAN unannotated frame.
@@ -209,6 +210,14 @@ def classify_face_worker(track_id, face_crop_bgr,
     watches the infant, and the registered "child" is just another
     known family member there — so a CHILD_DIR match reads as
     AUTHORIZED instead of CHILD whenever mode is "infant".
+
+    locked_target_id is the currently locked target's track_id (or
+    None if nothing is locked yet), snapshotted at submission time.
+    There is only ever ONE child. If this crop matches the CHILD
+    photos but a DIFFERENT track_id already holds the lock, that's a
+    false-positive face match, not a second child — it's treated as a
+    non-match here and falls through to the trusted/unauthorized
+    check, exactly like nobody-in-particular's face would.
     """
     global face_check_running
     timed_out = (time.time() - first_seen) >= FACE_CHECK_TIMEOUT_S
@@ -226,9 +235,16 @@ def classify_face_worker(track_id, face_crop_bgr,
 
         else:
             child_match = verify_folder(face_rgb, CHILD_DIR)
-            if child_match is True:
+            if child_match is True and \
+               (locked_target_id is None or locked_target_id == track_id):
                 result = "AUTHORIZED" if mode == "infant" else "CHILD"
             else:
+                if child_match is True:
+                    # Matched the child photos, but someone else is
+                    # already locked as the child — only one child
+                    # exists at a time, so this reads as a false
+                    # positive, not a second child.
+                    child_match = False
                 trusted_match = verify_folder(face_rgb, TRUSTED_DIR)
                 if trusted_match is True:
                     result = "AUTHORIZED"
@@ -553,7 +569,8 @@ def camera_loop():
                         crop,
                         clean_frame.copy(),  # clean snapshot
                         first_seen,
-                        mode
+                        mode,
+                        target_track_id
                     )
 
         # ── No face ever found for this person ─────────────────────
@@ -698,6 +715,25 @@ def camera_loop():
             result = (results_snap.get(tid, "CHECKING")
                       if tid is not None else "CHECKING")
 
+            is_target = (mode == "child" and target_state == "LOCKED"
+                         and p_idx == child_box_idx)
+
+            # There is only ever ONE child box on screen at a time —
+            # the locked target. classify_face_worker already refuses
+            # to hand out a second CHILD verdict once a target is
+            # locked, but this is a belt-and-suspenders display-layer
+            # guard against any stale/cached "CHILD" value ever being
+            # shown on a second box: once a target is locked (or
+            # temporarily lost — target_track_id still set either
+            # way), anyone reading CHILD who ISN'T that target_id
+            # displays exactly like an unauthorized person. Before any
+            # lock exists yet (target_track_id is None, still
+            # SEARCHING/CONFIRMING), the candidate's own CHILD reading
+            # is left alone — that's the normal pre-lock signal.
+            if result == "CHILD" and target_track_id is not None \
+               and tid != target_track_id:
+                result = "UNAUTHORIZED"
+
             if result == "CHILD":
                 color = (0, 255, 0)
                 label = "Child"
@@ -713,9 +749,6 @@ def camera_loop():
             else:
                 color = (180, 180, 180)
                 label = "Checking..."
-
-            is_target = (mode == "child" and target_state == "LOCKED"
-                         and p_idx == child_box_idx)
 
             cv2.rectangle(display_frame,
                           (x1, y1), (x2, y2), color,
